@@ -24,6 +24,7 @@
 #include <thread>
 
 #include "IMU_Processing.h"
+#include "adaptive_lio.hpp"
 #include "preprocess.h"
 
 // #define IVOX_NODE_TYPE_PHC
@@ -78,6 +79,13 @@ extern double time_update_last, time_current, time_predict_last_const, t_last;
 extern bool enable_prior_pcd;
 extern string prior_pcd_map_path;
 extern std::vector<double> init_pose;
+
+extern point_lio::SpatialAdaptiveConfig spatial_adaptive_config;
+extern point_lio::TemporalAdaptiveConfig temporal_adaptive_config;
+extern int min_scan_points, max_lidar_queue_size, max_imu_queue_size, ekf_max_iterations;
+extern double max_scan_duration, max_imu_time_gap, max_neighbor_distance;
+extern double map_insertion_delay, map_impact_pause_duration;
+extern int map_min_effective_points;
 
 extern MeasureGroup Measures;
 

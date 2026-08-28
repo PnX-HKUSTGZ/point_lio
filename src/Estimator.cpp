@@ -9,8 +9,10 @@ std::vector<V3D> pbody_list;
 std::vector<PointVector> Nearest_Points;
 std::shared_ptr<IVoxType> ivox_ = nullptr;  // localmap in ivox
 std::vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
-bool point_selected_surf[100000] = {0};
+std::vector<std::uint8_t> point_selected_surf;
 std::vector<M3D> crossmat_list;
+ActiveLidarPointVector active_lidar_points;
+point_lio::FrameDiagnostics frame_diagnostics;
 int effct_feat_num = 0;
 int k = 0;
 int idx = -1;
@@ -109,216 +111,256 @@ Eigen::Matrix<double, 30, 30> df_dx_output(state_output & s, const input_ikfom &
   return cov;
 }
 
+namespace
+{
+struct WeightedMeasurement
+{
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  const ActiveLidarPoint * active_point = nullptr;
+  V3D point_imu = V3D::Zero();
+  V3D point_world = V3D::Zero();
+  V3D normal = V3D::Zero();
+  double offset = 0.0;
+  double coefficient = 1.0;
+  double residual = 0.0;
+  double innovation_variance = 1.0;
+  double effective_weight = 1.0;
+  std::size_t scale_index = 0;
+};
+
+using WeightedMeasurementVector =
+  std::vector<WeightedMeasurement, Eigen::aligned_allocator<WeightedMeasurement>>;
+
+template <typename State>
+V3D resolvePointImu(const ActiveLidarPoint & active, const State & state)
+{
+  if (active.reanchored || !extrinsic_est_en) {
+    return active.point_imu;
+  }
+  return state.offset_R_L_I * active.point_lidar + state.offset_T_L_I;
+}
+
+template <typename State>
+void buildLidarMeasurement(
+  State & state, const Eigen::Matrix3d & cov_p, const Eigen::Matrix3d & cov_R,
+  esekfom::dyn_share_modified<double> & ekfom_data)
+{
+  WeightedMeasurementVector measurements;
+  const int query_count = spatial_adaptive_config.enabled ?
+    spatial_adaptive_config.neighbors.back() : NUM_MATCH_POINTS;
+  const double query_range = spatial_adaptive_config.enabled ?
+    std::min(max_neighbor_distance, spatial_adaptive_config.max_query_ranges.back()) :
+    max_neighbor_distance;
+
+  for (const auto & active : active_lidar_points) {
+    if (active.source_index >= feats_down_world->size() ||
+        active.source_index >= Nearest_Points.size()) {
+      continue;
+    }
+
+    const V3D point_imu = resolvePointImu(active, state);
+    const V3D point_world = state.rot * point_imu + state.pos;
+    PointType & point_world_msg = feats_down_world->points[active.source_index];
+    point_world_msg.x = point_world.x();
+    point_world_msg.y = point_world.y();
+    point_world_msg.z = point_world.z();
+    point_world_msg.intensity = feats_down_body->points[active.source_index].intensity;
+
+    auto & points_near = Nearest_Points[active.source_index];
+    ivox_->GetClosestPoint(point_world_msg, points_near, query_count, query_range);
+    std::sort(
+      points_near.begin(), points_near.end(), [&point_world_msg](const PointType & lhs, const PointType & rhs) {
+        return calc_dist<double>(point_world_msg, lhs) < calc_dist<double>(point_world_msg, rhs);
+      });
+    point_selected_surf[active.source_index] = 0;
+
+    if (!spatial_adaptive_config.enabled) {
+      if (points_near.size() < NUM_MATCH_POINTS ||
+          calc_dist<double>(point_world_msg, points_near[NUM_MATCH_POINTS - 1]) >
+            max_neighbor_distance * max_neighbor_distance) {
+        continue;
+      }
+      VF(4) plane;
+      plane.setZero();
+      if (!esti_plane(plane, points_near, plane_thr)) {
+        continue;
+      }
+      const V3D normal = plane.head<3>().cast<double>();
+      const double residual = normal.dot(point_world) + static_cast<double>(plane(3));
+      if (point_imu.norm() <= match_s * residual * residual) {
+        continue;
+      }
+
+      WeightedMeasurement measurement;
+      measurement.active_point = &active;
+      measurement.point_imu = point_imu;
+      measurement.point_world = point_world;
+      measurement.normal = normal;
+      measurement.offset = plane(3);
+      measurement.residual = residual;
+      measurement.innovation_variance = laser_point_cov;
+      measurements.emplace_back(measurement);
+      point_selected_surf[active.source_index] = 1;
+      frame_diagnostics.associated_points++;
+      continue;
+    }
+
+    std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> neighbor_vectors;
+    neighbor_vectors.reserve(points_near.size());
+    for (const auto & neighbor : points_near) {
+      neighbor_vectors.emplace_back(neighbor.x, neighbor.y, neighbor.z);
+    }
+
+    point_lio::PlaneModelVector models;
+    for (std::size_t scale = 0; scale < spatial_adaptive_config.neighbors.size(); ++scale) {
+      const int count = spatial_adaptive_config.neighbors[scale];
+      if (count < 3 || points_near.size() < static_cast<std::size_t>(count)) {
+        continue;
+      }
+      const double range = spatial_adaptive_config.max_query_ranges[scale];
+      if (calc_dist<double>(point_world_msg, points_near[count - 1]) > range * range) {
+        continue;
+      }
+
+      point_lio::PlaneModel model;
+      if (!point_lio::fitPlane(
+            neighbor_vectors, static_cast<std::size_t>(count),
+            spatial_adaptive_config.max_curvature,
+            spatial_adaptive_config.max_plane_residual, model)) {
+        continue;
+      }
+      model.scale_index = scale;
+      model.residual = model.normal.dot(point_world) + model.offset;
+      M3D point_crossmat;
+      point_crossmat << SKEW_SYM_MATRX(point_imu);
+      const V3D rotated_normal = state.rot.transpose() * model.normal;
+      const V3D rotation_jacobian = point_crossmat * rotated_normal;
+      const double state_variance =
+        model.normal.dot(cov_p * model.normal) +
+        rotation_jacobian.dot(cov_R * rotation_jacobian);
+      model.surface_variance =
+        std::max(model.surface_variance, spatial_adaptive_config.min_surface_variance);
+      model.innovation_variance =
+        std::max(laser_point_cov + model.surface_variance + state_variance, 1.0e-9);
+      models.emplace_back(model);
+    }
+
+    point_lio::computeResponsibilities(
+      models, spatial_adaptive_config.outlier_probability,
+      spatial_adaptive_config.normalized_residual_gate,
+      spatial_adaptive_config.student_t_dof,
+      spatial_adaptive_config.min_responsibility);
+
+    bool point_accepted = false;
+    for (const auto & model : models) {
+      if (model.responsibility <= 0.0 || model.robust_weight <= 0.0) {
+        continue;
+      }
+      const double measurement_variance =
+        std::max(laser_point_cov + model.surface_variance, 1.0e-9);
+      const double effective_weight = model.responsibility * model.robust_weight;
+      const double coefficient = std::min(
+        std::sqrt(effective_weight * laser_point_cov / measurement_variance),
+        spatial_adaptive_config.max_information_scale);
+      if (!std::isfinite(coefficient) || coefficient <= 0.0) {
+        continue;
+      }
+
+      WeightedMeasurement measurement;
+      measurement.active_point = &active;
+      measurement.point_imu = point_imu;
+      measurement.point_world = point_world;
+      measurement.normal = model.normal;
+      measurement.offset = model.offset;
+      measurement.coefficient = coefficient;
+      measurement.residual = model.residual;
+      measurement.innovation_variance = model.innovation_variance;
+      measurement.effective_weight = effective_weight;
+      measurement.scale_index = model.scale_index;
+      measurements.emplace_back(measurement);
+      frame_diagnostics.scale_responsibility[model.scale_index] += model.responsibility;
+      frame_diagnostics.effective_points += effective_weight;
+      point_accepted = true;
+    }
+    if (point_accepted) {
+      point_selected_surf[active.source_index] = 1;
+      frame_diagnostics.associated_points++;
+    }
+  }
+
+  if (measurements.empty()) {
+    ekfom_data.valid = false;
+    return;
+  }
+
+  ekfom_data.M_Noise = laser_point_cov;
+  ekfom_data.h_x = Eigen::MatrixXd::Zero(measurements.size(), 12);
+  ekfom_data.z.resize(measurements.size());
+  for (std::size_t row = 0; row < measurements.size(); ++row) {
+    const auto & measurement = measurements[row];
+    const V3D weighted_normal = measurement.coefficient * measurement.normal;
+    M3D point_imu_crossmat;
+    point_imu_crossmat << SKEW_SYM_MATRX(measurement.point_imu);
+    const V3D C(state.rot.transpose() * weighted_normal);
+    const V3D A(point_imu_crossmat * C);
+
+    if (extrinsic_est_en && !measurement.active_point->reanchored) {
+      M3D point_lidar_crossmat;
+      point_lidar_crossmat << SKEW_SYM_MATRX(measurement.active_point->point_lidar);
+      const V3D B(point_lidar_crossmat * state.offset_R_L_I.transpose() * C);
+      ekfom_data.h_x.block<1, 12>(row, 0) << VEC_FROM_ARRAY(weighted_normal),
+        VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
+    } else {
+      ekfom_data.h_x.block<1, 12>(row, 0) << VEC_FROM_ARRAY(weighted_normal),
+        VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+    }
+    ekfom_data.z(row) = -measurement.coefficient * measurement.residual;
+    frame_diagnostics.residual_abs_sum += std::abs(measurement.residual);
+    frame_diagnostics.nis_sum += measurement.residual * measurement.residual /
+                                 std::max(measurement.innovation_variance, 1.0e-9);
+  }
+
+  if (spatial_adaptive_config.enabled && measurements.size() >= 6) {
+    const Eigen::Matrix<double, 6, 6> raw_information =
+      ekfom_data.h_x.leftCols(6).transpose() * ekfom_data.h_x.leftCols(6);
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(raw_information);
+    if (solver.info() == Eigen::Success) {
+      const double largest = std::max(solver.eigenvalues().maxCoeff(), 1.0e-12);
+      Eigen::Matrix<double, 6, 6> observable = Eigen::Matrix<double, 6, 6>::Zero();
+      for (int axis = 0; axis < 6; ++axis) {
+        if (solver.eigenvalues()(axis) >= largest * spatial_adaptive_config.degeneracy_eigen_ratio) {
+          observable(axis, axis) = 1.0;
+        }
+      }
+      const Eigen::Matrix<double, 6, 6> projection =
+        solver.eigenvectors() * observable * solver.eigenvectors().transpose();
+      ekfom_data.h_x.leftCols(6) = ekfom_data.h_x.leftCols(6) * projection;
+    }
+  }
+
+  frame_diagnostics.effective_rows += measurements.size();
+  frame_diagnostics.pose_information.noalias() +=
+    ekfom_data.h_x.leftCols(6).transpose() * ekfom_data.h_x.leftCols(6) /
+    std::max(laser_point_cov, 1.0e-9);
+  if (!spatial_adaptive_config.enabled) {
+    frame_diagnostics.effective_points += static_cast<double>(measurements.size());
+  }
+  effct_feat_num += static_cast<int>(measurements.size());
+}
+}  // namespace
+
 void h_model_input(
   state_input & s, Eigen::Matrix3d cov_p, Eigen::Matrix3d cov_R,
   esekfom::dyn_share_modified<double> & ekfom_data)
 {
-  bool match_in_map = false;
-  VF(4) pabcd;
-  pabcd.setZero();
-  normvec->resize(time_seq[k]);
-  int effect_num_k = 0;
-  for (int j = 0; j < time_seq[k]; j++) {
-    PointType & point_body_j = feats_down_body->points[idx + j + 1];
-    PointType & point_world_j = feats_down_world->points[idx + j + 1];
-    pointBodyToWorld(&point_body_j, &point_world_j);
-    V3D p_body = pbody_list[idx + j + 1];
-    double p_norm = p_body.norm();
-    V3D p_world;
-    p_world << point_world_j.x, point_world_j.y, point_world_j.z;
-    {
-      auto & points_near = Nearest_Points[idx + j + 1];
-      ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS);  //
-      if ((points_near.size() <
-           NUM_MATCH_POINTS))  // || pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5) // 5)
-      {
-        point_selected_surf[idx + j + 1] = false;
-      } else {
-        point_selected_surf[idx + j + 1] = false;
-        if (esti_plane(pabcd, points_near, plane_thr))  //(planeValid)
-        {
-          float pd2 = fabs(
-            pabcd(0) * point_world_j.x + pabcd(1) * point_world_j.y + pabcd(2) * point_world_j.z +
-            pabcd(3));
-          // V3D norm_vec;
-          // M3D Rpf, pf;
-          // pf = crossmat_list[idx+j+1];
-          // // pf << SKEW_SYM_MATRX(p_body);
-          // Rpf = s.rot * pf;
-          // norm_vec << pabcd(0), pabcd(1), pabcd(2);
-          // double noise_state = norm_vec.transpose() * (cov_p+Rpf*cov_R*Rpf.transpose())  * norm_vec + sqrt(p_norm) * 0.001;
-          // // if (p_norm > match_s * pd2 * pd2)
-          // double epsilon = pd2 / sqrt(noise_state);
-          // // std::cout << "check epsilon:" << epsilon << '\n';
-          // double weight = 1.0; // epsilon / sqrt(epsilon * epsilon+1);
-          // if (epsilon > 1.0)
-          // {
-          // 	weight = sqrt(2 * epsilon - 1) / epsilon;
-          // 	pabcd(0) = weight * pabcd(0);
-          // 	pabcd(1) = weight * pabcd(1);
-          // 	pabcd(2) = weight * pabcd(2);
-          // 	pabcd(3) = weight * pabcd(3);
-          // }
-          if (p_norm > match_s * pd2 * pd2) {
-            point_selected_surf[idx + j + 1] = true;
-            normvec->points[j].x = pabcd(0);
-            normvec->points[j].y = pabcd(1);
-            normvec->points[j].z = pabcd(2);
-            normvec->points[j].intensity = pabcd(3);
-            effect_num_k++;
-          }
-        }
-      }
-    }
-  }
-  if (effect_num_k == 0) {
-    ekfom_data.valid = false;
-    return;
-  }
-  ekfom_data.M_Noise = laser_point_cov;
-  ekfom_data.h_x.resize(effect_num_k, 12);
-  ekfom_data.h_x = Eigen::MatrixXd::Zero(effect_num_k, 12);
-  ekfom_data.z.resize(effect_num_k);
-  int m = 0;
-
-  for (int j = 0; j < time_seq[k]; j++) {
-    // ekfom_data.converge = false;
-    if (point_selected_surf[idx + j + 1]) {
-      V3D norm_vec(normvec->points[j].x, normvec->points[j].y, normvec->points[j].z);
-
-      if (extrinsic_est_en) {
-        V3D p_body = pbody_list[idx + j + 1];
-        M3D p_crossmat, p_imu_crossmat;
-        p_crossmat << SKEW_SYM_MATRX(p_body);
-        V3D point_imu = s.offset_R_L_I * p_body + s.offset_T_L_I;
-        p_imu_crossmat << SKEW_SYM_MATRX(point_imu);
-        V3D C(s.rot.transpose() * norm_vec);
-        V3D A(p_imu_crossmat * C);
-        V3D B(p_crossmat * s.offset_R_L_I.transpose() * C);
-        ekfom_data.h_x.block<1, 12>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2),
-          VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
-      } else {
-        M3D point_crossmat = crossmat_list[idx + j + 1];
-        V3D C(s.rot.transpose() * norm_vec);  // conjugate().normalized()
-        V3D A(point_crossmat * C);
-        ekfom_data.h_x.block<1, 12>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2),
-          VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
-      }
-      ekfom_data.z(m) = -norm_vec(0) * feats_down_world->points[idx + j + 1].x -
-                        norm_vec(1) * feats_down_world->points[idx + j + 1].y -
-                        norm_vec(2) * feats_down_world->points[idx + j + 1].z -
-                        normvec->points[j].intensity;
-
-      m++;
-    }
-  }
-  effct_feat_num += effect_num_k;
+  buildLidarMeasurement(s, cov_p, cov_R, ekfom_data);
 }
 
 void h_model_output(
   state_output & s, Eigen::Matrix3d cov_p, Eigen::Matrix3d cov_R,
   esekfom::dyn_share_modified<double> & ekfom_data)
 {
-  bool match_in_map = false;
-  VF(4) pabcd;
-  pabcd.setZero();
-  normvec->resize(time_seq[k]);
-  int effect_num_k = 0;
-  for (int j = 0; j < time_seq[k]; j++) {
-    PointType & point_body_j = feats_down_body->points[idx + j + 1];
-    PointType & point_world_j = feats_down_world->points[idx + j + 1];
-    pointBodyToWorld(&point_body_j, &point_world_j);
-    V3D p_body = pbody_list[idx + j + 1];
-    double p_norm = p_body.norm();
-    V3D p_world;
-    p_world << point_world_j.x, point_world_j.y, point_world_j.z;
-    {
-      auto & points_near = Nearest_Points[idx + j + 1];
-
-      ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS);  //
-
-      if ((points_near.size() <
-           NUM_MATCH_POINTS))  // || pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5)
-      {
-        point_selected_surf[idx + j + 1] = false;
-      } else {
-        point_selected_surf[idx + j + 1] = false;
-        if (esti_plane(pabcd, points_near, plane_thr))  //(planeValid)
-        {
-          float pd2 = fabs(
-            pabcd(0) * point_world_j.x + pabcd(1) * point_world_j.y + pabcd(2) * point_world_j.z +
-            pabcd(3));
-          // V3D norm_vec;
-          // M3D Rpf, pf;
-          // pf = crossmat_list[idx+j+1];
-          // // pf << SKEW_SYM_MATRX(p_body);
-          // Rpf = s.rot * pf;
-          // norm_vec << pabcd(0), pabcd(1), pabcd(2);
-          // double noise_state = norm_vec.transpose() * (cov_p+Rpf*cov_R*Rpf.transpose())  * norm_vec + sqrt(p_norm) * 0.001;
-          // // if (p_norm > match_s * pd2 * pd2)
-          // double epsilon = pd2 / sqrt(noise_state);
-          // double weight = 1.0; // epsilon / sqrt(epsilon * epsilon+1);
-          // if (epsilon > 1.0)
-          // {
-          // 	weight = sqrt(2 * epsilon - 1) / epsilon;
-          // 	pabcd(0) = weight * pabcd(0);
-          // 	pabcd(1) = weight * pabcd(1);
-          // 	pabcd(2) = weight * pabcd(2);
-          // 	pabcd(3) = weight * pabcd(3);
-          // }
-          if (p_norm > match_s * pd2 * pd2) {
-            // point_selected_surf[i] = true;
-            point_selected_surf[idx + j + 1] = true;
-            normvec->points[j].x = pabcd(0);
-            normvec->points[j].y = pabcd(1);
-            normvec->points[j].z = pabcd(2);
-            normvec->points[j].intensity = pabcd(3);
-            effect_num_k++;
-          }
-        }
-      }
-    }
-  }
-  if (effect_num_k == 0) {
-    ekfom_data.valid = false;
-    return;
-  }
-  ekfom_data.M_Noise = laser_point_cov;
-  ekfom_data.h_x.resize(effect_num_k, 12);
-  ekfom_data.h_x = Eigen::MatrixXd::Zero(effect_num_k, 12);
-  ekfom_data.z.resize(effect_num_k);
-  int m = 0;
-  for (int j = 0; j < time_seq[k]; j++) {
-    // ekfom_data.converge = false;
-    if (point_selected_surf[idx + j + 1]) {
-      V3D norm_vec(normvec->points[j].x, normvec->points[j].y, normvec->points[j].z);
-      if (extrinsic_est_en) {
-        V3D p_body = pbody_list[idx + j + 1];
-        M3D p_crossmat, p_imu_crossmat;
-        p_crossmat << SKEW_SYM_MATRX(p_body);
-        V3D point_imu = s.offset_R_L_I * p_body + s.offset_T_L_I;
-        p_imu_crossmat << SKEW_SYM_MATRX(point_imu);
-        V3D C(s.rot.transpose() * norm_vec);
-        V3D A(p_imu_crossmat * C);
-        V3D B(p_crossmat * s.offset_R_L_I.transpose() * C);
-        ekfom_data.h_x.block<1, 12>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2),
-          VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
-      } else {
-        M3D point_crossmat = crossmat_list[idx + j + 1];
-        V3D C(s.rot.transpose() * norm_vec);  // conjugate().normalized()
-        V3D A(point_crossmat * C);
-        ekfom_data.h_x.block<1, 12>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2),
-          VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
-      }
-      ekfom_data.z(m) = -norm_vec(0) * feats_down_world->points[idx + j + 1].x -
-                        norm_vec(1) * feats_down_world->points[idx + j + 1].y -
-                        norm_vec(2) * feats_down_world->points[idx + j + 1].z -
-                        normvec->points[j].intensity;
-
-      m++;
-    }
-  }
-  effct_feat_num += effect_num_k;
+  buildLidarMeasurement(s, cov_p, cov_R, ekfom_data);
 }
 
 void h_model_IMU_output(state_output & s, esekfom::dyn_share_modified<double> & ekfom_data)
@@ -331,31 +373,37 @@ void h_model_IMU_output(state_output & s, esekfom::dyn_share_modified<double> & 
   if (check_satu) {
     if (fabs(angvel_avr(0)) >= 0.99 * satu_gyro) {
       ekfom_data.satu_check[0] = true;
+      frame_diagnostics.imu_saturated = true;
       ekfom_data.z_IMU(0) = 0.0;
     }
 
     if (fabs(angvel_avr(1)) >= 0.99 * satu_gyro) {
       ekfom_data.satu_check[1] = true;
+      frame_diagnostics.imu_saturated = true;
       ekfom_data.z_IMU(1) = 0.0;
     }
 
     if (fabs(angvel_avr(2)) >= 0.99 * satu_gyro) {
       ekfom_data.satu_check[2] = true;
+      frame_diagnostics.imu_saturated = true;
       ekfom_data.z_IMU(2) = 0.0;
     }
 
     if (fabs(acc_avr(0)) >= 0.99 * satu_acc) {
       ekfom_data.satu_check[3] = true;
+      frame_diagnostics.imu_saturated = true;
       ekfom_data.z_IMU(3) = 0.0;
     }
 
     if (fabs(acc_avr(1)) >= 0.99 * satu_acc) {
       ekfom_data.satu_check[4] = true;
+      frame_diagnostics.imu_saturated = true;
       ekfom_data.z_IMU(4) = 0.0;
     }
 
     if (fabs(acc_avr(2)) >= 0.99 * satu_acc) {
       ekfom_data.satu_check[5] = true;
+      frame_diagnostics.imu_saturated = true;
       ekfom_data.z_IMU(5) = 0.0;
     }
   }

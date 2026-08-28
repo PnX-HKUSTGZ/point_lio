@@ -64,6 +64,7 @@ public:
     float inv_resolution_ = 10.0;                   // inverse resolution
     NearbyType nearby_type_ = NearbyType::NEARBY6;  // nearby range
     std::size_t capacity_ = 1000000;                // capacity
+    std::size_t max_points_per_voxel_ = 64;         // bound query cost and memory
   };
 
   /**
@@ -231,6 +232,16 @@ size_t IVox<dim, node_type, PointType>::NumValidGrids() const
 }
 
 template <int dim, IVoxNodeType node_type, typename PointType>
+size_t IVox<dim, node_type, PointType>::NumPoints() const
+{
+  size_t count = 0;
+  for (const auto & grid : grids_cache_) {
+    count += grid.second.Size();
+  }
+  return count;
+}
+
+template <int dim, IVoxNodeType node_type, typename PointType>
 void IVox<dim, node_type, PointType>::GenerateNearbyGrids()
 {
   if (options_.nearby_type_ == NearbyType::CENTER) {
@@ -288,6 +299,7 @@ void IVox<dim, node_type, PointType>::AddPoints(const PointVector & points_to_ad
       center.getVector3fMap() = key.template cast<float>() * options_.resolution_;
 
       grids_cache_.push_front({key, NodeType(center, options_.resolution_)});
+      grids_cache_.front().second.SetMaxPoints(options_.max_points_per_voxel_);
       grids_map_.insert({key, grids_cache_.begin()});
 
       grids_cache_.front().second.InsertPoint(points_to_add[i]);
@@ -329,6 +341,9 @@ std::vector<float> IVox<dim, node_type, PointType>::StatGridPoints() const
     min = s < min ? s : min;
     sum += s;
     sum_square += s * s;
+  }
+  if (num == 0) {
+    return std::vector<float>{0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
   }
   float ave = float(sum) / num;
   float stddev = num > 1 ? sqrt((float(sum_square) - num * ave * ave) / (num - 1)) : 0;

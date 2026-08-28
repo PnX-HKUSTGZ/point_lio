@@ -10,6 +10,11 @@
 
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
+#include <diagnostic_msgs/msg/key_value.hpp>
+#include <limits>
+#include <sstream>
 
 #include "li_initialization.h"
 
@@ -47,6 +52,116 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 int sleep_time = 0;
 
 auto LOGGER = rclcpp::get_logger("laserMapping");
+
+namespace
+{
+struct PendingTemporalPoint
+{
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  std::size_t source_index = 0;
+  V3D point_lidar = V3D::Zero();
+  V3D point_imu = V3D::Zero();
+  V3D predicted_world = V3D::Zero();
+};
+
+using PendingTemporalPointVector =
+  std::vector<PendingTemporalPoint, Eigen::aligned_allocator<PendingTemporalPoint>>;
+
+struct PendingMapUpdate
+{
+  double stamp = 0.0;
+  PointVector points;
+};
+
+PendingTemporalPointVector pending_temporal_points;
+std::deque<PendingMapUpdate> pending_map_updates;
+point_lio::TemporalUpdateScheduler temporal_scheduler;
+double map_pause_until = -std::numeric_limits<double>::infinity();
+std::size_t committed_map_frames = 0;
+std::size_t rejected_map_frames = 0;
+
+template <typename Covariance>
+Eigen::Matrix<double, 6, 6> poseCovariance(const Covariance & covariance)
+{
+  Eigen::Matrix<double, 6, 6> result;
+  result.topLeftCorner<3, 3>() = covariance.template block<3, 3>(0, 0);
+  result.topRightCorner<3, 3>() = covariance.template block<3, 3>(0, 3);
+  result.bottomLeftCorner<3, 3>() = covariance.template block<3, 3>(3, 0);
+  result.bottomRightCorner<3, 3>() = covariance.template block<3, 3>(3, 3);
+  return 0.5 * (result + result.transpose());
+}
+
+template <typename State>
+void appendTemporalGroup(const State & state, int first_index, int count)
+{
+  for (int offset = 0; offset < count; ++offset) {
+    const std::size_t source_index = static_cast<std::size_t>(first_index + offset);
+    const auto & point = feats_down_body->points[source_index];
+    PendingTemporalPoint pending;
+    pending.source_index = source_index;
+    pending.point_lidar = V3D(point.x, point.y, point.z);
+    pending.point_imu = extrinsic_est_en ?
+      state.offset_R_L_I * pending.point_lidar + state.offset_T_L_I : pbody_list[source_index];
+    pending.predicted_world = state.rot * pending.point_imu + state.pos;
+    pending_temporal_points.emplace_back(pending);
+
+    auto & world = feats_down_world->points[source_index];
+    world.x = pending.predicted_world.x();
+    world.y = pending.predicted_world.y();
+    world.z = pending.predicted_world.z();
+    world.intensity = point.intensity;
+  }
+}
+
+template <typename State>
+void prepareActiveMeasurements(const State & state)
+{
+  active_lidar_points.clear();
+  active_lidar_points.reserve(pending_temporal_points.size());
+  for (const auto & pending : pending_temporal_points) {
+    ActiveLidarPoint active;
+    active.source_index = pending.source_index;
+    active.point_lidar = pending.point_lidar;
+    if (temporal_adaptive_config.enabled) {
+      active.point_imu = state.rot.transpose() * (pending.predicted_world - state.pos);
+      active.reanchored = true;
+    } else {
+      active.point_imu = pending.point_imu;
+      active.reanchored = false;
+    }
+    active_lidar_points.emplace_back(active);
+  }
+}
+
+template <typename State>
+void transformActiveMeasurements(const State & state)
+{
+  for (const auto & active : active_lidar_points) {
+    if (active.source_index >= feats_down_world->size()) {
+      continue;
+    }
+    const V3D point_imu = (extrinsic_est_en && !active.reanchored) ?
+      state.offset_R_L_I * active.point_lidar + state.offset_T_L_I : active.point_imu;
+    const V3D world = state.rot * point_imu + state.pos;
+    auto & output = feats_down_world->points[active.source_index];
+    output.x = world.x();
+    output.y = world.y();
+    output.z = world.z();
+    output.intensity = feats_down_body->points[active.source_index].intensity;
+  }
+}
+
+template <typename T>
+diagnostic_msgs::msg::KeyValue diagnosticValue(const std::string & key, const T & value)
+{
+  diagnostic_msgs::msg::KeyValue output;
+  output.key = key;
+  std::ostringstream stream;
+  stream << value;
+  output.value = stream.str();
+  return output;
+}
+}  // namespace
 
 void SigHandle(int sig)
 {
@@ -127,7 +242,7 @@ void pointBodyLidarToIMU(PointType const * const pi, PointType * const po)
   po->intensity = pi->intensity;
 }
 
-void MapIncremental()
+PointVector collectMapPoints()
 {
   PointVector points_to_add;
   int cur_pts = feats_down_world->size();
@@ -160,7 +275,44 @@ void MapIncremental()
       points_to_add.emplace_back(point_world);
     }
   }
-  ivox_->AddPoints(points_to_add);
+  return points_to_add;
+}
+
+void processPendingMapUpdates(double current_stamp)
+{
+  if (frame_diagnostics.imu_saturated || imu_gap_detected) {
+    map_pause_until = std::max(map_pause_until, current_stamp + map_impact_pause_duration);
+    rejected_map_frames += pending_map_updates.size();
+    pending_map_updates.clear();
+    imu_gap_detected = false;
+  }
+  if (current_stamp < map_pause_until) {
+    return;
+  }
+
+  while (!pending_map_updates.empty() &&
+         current_stamp - pending_map_updates.front().stamp >= map_insertion_delay) {
+    ivox_->AddPoints(pending_map_updates.front().points);
+    pending_map_updates.pop_front();
+    ++committed_map_frames;
+  }
+}
+
+void queueMapIncremental(double current_stamp, bool quality_ok)
+{
+  if (!quality_ok || current_stamp < map_pause_until) {
+    ++rejected_map_frames;
+    processPendingMapUpdates(current_stamp);
+    return;
+  }
+
+  PendingMapUpdate update;
+  update.stamp = current_stamp;
+  update.points = collectMapPoints();
+  if (!update.points.empty()) {
+    pending_map_updates.emplace_back(std::move(update));
+  }
+  processPendingMapUpdates(current_stamp);
 }
 
 void publish_init_map(
@@ -247,7 +399,7 @@ void set_posestamp(T & out)
   };
 
   if (!use_imu_as_input) {
-    if (enable_prior_pcd && is_first_kf) {
+    if (enable_prior_pcd && is_first_kf && init_pose.size() >= 3) {
       // Execute only on the first call
       kf_output.x_.pos(0) = init_pose[0];
       kf_output.x_.pos(1) = init_pose[1];
@@ -274,6 +426,13 @@ void publish_odometry(
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
   }
   set_posestamp(odomAftMapped.pose.pose);
+  const Eigen::Matrix<double, 6, 6> pose_covariance = use_imu_as_input ?
+    poseCovariance(kf_input.get_P()) : poseCovariance(kf_output.get_P());
+  for (int row = 0; row < 6; ++row) {
+    for (int column = 0; column < 6; ++column) {
+      odomAftMapped.pose.covariance[row * 6 + column] = pose_covariance(row, column);
+    }
+  }
 
   pubOdomAftMapped->publish(odomAftMapped);
 
@@ -308,15 +467,84 @@ void publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPat
   }
 }
 
+void publish_diagnostics(
+  const rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr & publisher,
+  double stamp, double processing_ms)
+{
+  diagnostic_msgs::msg::DiagnosticArray message;
+  message.header.stamp = get_ros_time(stamp);
+  diagnostic_msgs::msg::DiagnosticStatus status;
+  status.name = "point_lio/estimator";
+  status.hardware_id = "point_lio";
+  const bool low_geometry =
+    frame_diagnostics.effective_points < static_cast<double>(map_min_effective_points);
+  status.level = (frame_diagnostics.imu_saturated || low_geometry) ?
+    diagnostic_msgs::msg::DiagnosticStatus::WARN : diagnostic_msgs::msg::DiagnosticStatus::OK;
+  status.message = frame_diagnostics.imu_saturated ? "imu_saturated" :
+    (low_geometry ? "low_geometry" : "ok");
+
+  const Eigen::Matrix<double, 6, 6> pose_covariance = use_imu_as_input ?
+    poseCovariance(kf_input.get_P()) : poseCovariance(kf_output.get_P());
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> information_solver(
+    frame_diagnostics.pose_information, Eigen::EigenvaluesOnly);
+  double min_information_eigenvalue = 0.0;
+  double information_condition = std::numeric_limits<double>::infinity();
+  if (information_solver.info() == Eigen::Success) {
+    min_information_eigenvalue = information_solver.eigenvalues().minCoeff();
+    information_condition = information_solver.eigenvalues().maxCoeff() /
+      std::max(min_information_eigenvalue, 1.0e-12);
+  }
+
+  const double row_count = std::max<std::size_t>(frame_diagnostics.effective_rows, 1);
+  status.values = {
+    diagnosticValue("raw_points", frame_diagnostics.raw_points),
+    diagnosticValue("filtered_points", frame_diagnostics.filtered_points),
+    diagnosticValue("associated_points", frame_diagnostics.associated_points),
+    diagnosticValue("effective_rows", frame_diagnostics.effective_rows),
+    diagnosticValue("effective_points", frame_diagnostics.effective_points),
+    diagnosticValue("lidar_updates", frame_diagnostics.lidar_updates),
+    diagnosticValue("skipped_updates", frame_diagnostics.skipped_updates),
+    diagnosticValue("mean_abs_residual", frame_diagnostics.residual_abs_sum / row_count),
+    diagnosticValue("mean_nis", frame_diagnostics.nis_sum / row_count),
+    diagnosticValue("information_gain", frame_diagnostics.information_gain_sum),
+    diagnosticValue("pose_cov_logdet", point_lio::stableLogDet(pose_covariance)),
+    diagnosticValue("min_information_eigenvalue", min_information_eigenvalue),
+    diagnosticValue("information_condition", information_condition),
+    diagnosticValue("scale_0_responsibility", frame_diagnostics.scale_responsibility[0]),
+    diagnosticValue("scale_1_responsibility", frame_diagnostics.scale_responsibility[1]),
+    diagnosticValue("scale_2_responsibility", frame_diagnostics.scale_responsibility[2]),
+    diagnosticValue("scheduler_target_points", temporal_scheduler.commandedPoints()),
+    diagnosticValue("information_per_point", temporal_scheduler.informationPerPoint()),
+    diagnosticValue("processing_ms", processing_ms),
+    diagnosticValue("lidar_queue", lidar_buffer.size()),
+    diagnosticValue("imu_queue", imu_deque.size()),
+    diagnosticValue("dropped_lidar_frames", dropped_lidar_frames),
+    diagnosticValue("dropped_imu_messages", dropped_imu_messages),
+    diagnosticValue("pending_map_frames", pending_map_updates.size()),
+    diagnosticValue("committed_map_frames", committed_map_frames),
+    diagnosticValue("rejected_map_frames", rejected_map_frames),
+    diagnosticValue("map_voxels", ivox_->NumValidGrids()),
+    diagnosticValue("map_points", ivox_->NumPoints())};
+  message.status.emplace_back(std::move(status));
+  publisher->publish(message);
+}
+
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
   auto nh = std::make_shared<rclcpp::Node>("laserMapping");
 
-  rclcpp::executors::MultiThreadedExecutor executor;
+  rclcpp::executors::SingleThreadedExecutor executor;
   executor.add_node(nh);
 
   readParameters(nh);
+  if (temporal_adaptive_config.enabled && extrinsic_est_en) {
+    RCLCPP_WARN(
+      LOGGER,
+      "temporal adaptation requires fixed LiDAR-IMU extrinsics; disabling temporal adaptation");
+    temporal_adaptive_config.enabled = false;
+  }
+  temporal_scheduler.setConfig(temporal_adaptive_config);
   std::cout << "lidar_type: " << lidar_type << '\n';
   ivox_ = std::make_shared<IVoxType>(ivox_options_);
 
@@ -328,7 +556,6 @@ int main(int argc, char ** argv)
   double aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0,
          aver_time_solve = 0, aver_time_propag = 0;
 
-  memset(point_selected_surf, true, sizeof(point_selected_surf));
   downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
   downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
 
@@ -351,6 +578,8 @@ int main(int argc, char ** argv)
   kf_input.init_dyn_share_modified_2h(get_f_input, df_dx_input, h_model_input);
   kf_output.init_dyn_share_modified_3h(
     get_f_output, df_dx_output, h_model_output, h_model_IMU_output);
+  kf_input.set_maximum_iterations(ekf_max_iterations);
+  kf_output.set_maximum_iterations(ekf_max_iterations);
   Eigen::Matrix<double, 24, 24> P_init;  // = MD(18, 18)::Identity() * 0.1;
   reset_cov(P_init);
   kf_input.change_P(P_init);
@@ -389,6 +618,8 @@ int main(int argc, char ** argv)
   auto pub_odom_aft_mapped =
     nh->create_publisher<nav_msgs::msg::Odometry>("aft_mapped_to_init", 20);
   auto pub_path = nh->create_publisher<nav_msgs::msg::Path>("path", 20);
+  auto pub_diagnostics =
+    nh->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("point_lio/diagnostics", 10);
   auto tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(nh);
 
   //------------------------------------------------------------------------------------------------------
@@ -398,6 +629,8 @@ int main(int argc, char ** argv)
     if (flg_exit) break;
     executor.spin_some();
     if (sync_packages(Measures)) {
+      frame_diagnostics.reset();
+      frame_diagnostics.raw_points = Measures.lidar ? Measures.lidar->size() : 0;
       if (flg_reset) {
         RCLCPP_WARN(LOGGER, "reset when rosbag play back");
         p_imu->Reset();
@@ -415,6 +648,11 @@ int main(int argc, char ** argv)
         is_first_frame = true;
         flg_reset = false;
         init_map = false;
+        pending_temporal_points.clear();
+        active_lidar_points.clear();
+        pending_map_updates.clear();
+        temporal_scheduler.reset();
+        map_pause_until = -std::numeric_limits<double>::infinity();
 
         {
           ivox_.reset(new IVoxType(ivox_options_));
@@ -482,6 +720,7 @@ int main(int argc, char ** argv)
       {
         time_seq = time_compressing<int>(feats_down_body);
         feats_down_size = feats_down_body->points.size();
+        frame_diagnostics.filtered_points = feats_down_size;
       }
 
       if (!p_imu->after_imu_init_)  // !p_imu->UseLIInit &&
@@ -506,6 +745,10 @@ int main(int argc, char ** argv)
           continue;
         }
       }
+      if (feats_down_body->empty()) {
+        RCLCPP_WARN(LOGGER, "No point after downsampling, skip this scan!");
+        continue;
+      }
       /*** initialize the map ***/
       if (!init_map) {
         feats_down_world->resize(feats_undistort->size());
@@ -521,6 +764,10 @@ int main(int argc, char ** argv)
         if (init_feats_world->size() >= init_map_size) {
           if (enable_prior_pcd) {
             auto map_cloud = loadPointcloudFromPcd(prior_pcd_map_path);
+            if (!map_cloud || map_cloud->empty()) {
+              RCLCPP_ERROR(LOGGER, "prior PCD is unavailable or empty; skip map initialization");
+              continue;
+            }
             ivox_->AddPoints(map_cloud->points);
           } else {
             ivox_->AddPoints(init_feats_world->points);
@@ -543,8 +790,11 @@ int main(int argc, char ** argv)
       t2 = omp_get_wtime();
 
       /*** iterated state estimation ***/
-      crossmat_list.reserve(feats_down_size);
-      pbody_list.reserve(feats_down_size);
+      crossmat_list.resize(feats_down_size);
+      pbody_list.resize(feats_down_size);
+      point_selected_surf.assign(feats_down_size, 0);
+      pending_temporal_points.clear();
+      active_lidar_points.clear();
       // pbody_ext_list.reserve(feats_down_size);
 
       for (size_t i = 0; i < feats_down_body->size(); i++) {
@@ -674,11 +924,47 @@ int main(int argc, char ** argv)
               idx += time_seq[k];
               continue;
             }
-            if (!kf_output.update_iterated_dyn_share_modified()) {
-              idx = idx + time_seq[k];
+            appendTemporalGroup(kf_output.x_, idx + 1, time_seq[k]);
+            const auto covariance_before = poseCovariance(kf_output.get_P());
+            const bool force_update = (k + 1 == static_cast<int>(time_seq.size()));
+            const bool should_update = temporal_scheduler.shouldUpdate(
+              time_current, time_seq[k], kf_output.x_.pos, kf_output.x_.rot,
+              covariance_before.trace(), force_update);
+            if (!should_update) {
+              ++frame_diagnostics.skipped_updates;
+              idx += time_seq[k];
               continue;
             }
+
+            prepareActiveMeasurements(kf_output.x_);
+            const double logdet_before = point_lio::stableLogDet(covariance_before);
+            const double effective_before = frame_diagnostics.effective_points;
             solve_start = omp_get_wtime();
+            if (!kf_output.update_iterated_dyn_share_modified()) {
+              if (force_update) {
+                temporal_scheduler.recordUpdate(
+                  time_current, kf_output.x_.pos, kf_output.x_.rot, 0.0, 0.0);
+                pending_temporal_points.clear();
+                active_lidar_points.clear();
+              }
+              idx += time_seq[k];
+              continue;
+            }
+            transformActiveMeasurements(kf_output.x_);
+            const double logdet_after =
+              point_lio::stableLogDet(poseCovariance(kf_output.get_P()));
+            const double information_gain =
+              (std::isfinite(logdet_before) && std::isfinite(logdet_after)) ?
+              std::max(0.0, 0.5 * (logdet_before - logdet_after)) : 0.0;
+            const double effective_update_points =
+              std::max(0.0, frame_diagnostics.effective_points - effective_before);
+            temporal_scheduler.recordUpdate(
+              time_current, kf_output.x_.pos, kf_output.x_.rot, information_gain,
+              effective_update_points);
+            frame_diagnostics.information_gain_sum += information_gain;
+            ++frame_diagnostics.lidar_updates;
+            pending_temporal_points.clear();
+            active_lidar_points.clear();
 
             if (publish_odometry_without_downsample) {
               /******* Publish odometry *******/
@@ -694,12 +980,6 @@ int main(int argc, char ** argv)
                          << " " << kf_output.x_.ba.transpose() << " "
                          << feats_undistort->points.size() << '\n';
               }
-            }
-
-            for (int j = 0; j < time_seq[k]; j++) {
-              PointType & point_body_j = feats_down_body->points[idx + j + 1];
-              PointType & point_world_j = feats_down_world->points[idx + j + 1];
-              pointBodyToWorld(&point_body_j, &point_world_j);
             }
 
             solve_time += omp_get_wtime() - solve_start;
@@ -857,12 +1137,47 @@ int main(int argc, char ** argv)
               idx += time_seq[k];
               continue;
             }
-            if (!kf_input.update_iterated_dyn_share_modified()) {
-              idx = idx + time_seq[k];
+            appendTemporalGroup(kf_input.x_, idx + 1, time_seq[k]);
+            const auto covariance_before = poseCovariance(kf_input.get_P());
+            const bool force_update = (k + 1 == static_cast<int>(time_seq.size()));
+            const bool should_update = temporal_scheduler.shouldUpdate(
+              time_current, time_seq[k], kf_input.x_.pos, kf_input.x_.rot,
+              covariance_before.trace(), force_update);
+            if (!should_update) {
+              ++frame_diagnostics.skipped_updates;
+              idx += time_seq[k];
               continue;
             }
 
+            prepareActiveMeasurements(kf_input.x_);
+            const double logdet_before = point_lio::stableLogDet(covariance_before);
+            const double effective_before = frame_diagnostics.effective_points;
             solve_start = omp_get_wtime();
+            if (!kf_input.update_iterated_dyn_share_modified()) {
+              if (force_update) {
+                temporal_scheduler.recordUpdate(
+                  time_current, kf_input.x_.pos, kf_input.x_.rot, 0.0, 0.0);
+                pending_temporal_points.clear();
+                active_lidar_points.clear();
+              }
+              idx += time_seq[k];
+              continue;
+            }
+            transformActiveMeasurements(kf_input.x_);
+            const double logdet_after =
+              point_lio::stableLogDet(poseCovariance(kf_input.get_P()));
+            const double information_gain =
+              (std::isfinite(logdet_before) && std::isfinite(logdet_after)) ?
+              std::max(0.0, 0.5 * (logdet_before - logdet_after)) : 0.0;
+            const double effective_update_points =
+              std::max(0.0, frame_diagnostics.effective_points - effective_before);
+            temporal_scheduler.recordUpdate(
+              time_current, kf_input.x_.pos, kf_input.x_.rot, information_gain,
+              effective_update_points);
+            frame_diagnostics.information_gain_sum += information_gain;
+            ++frame_diagnostics.lidar_updates;
+            pending_temporal_points.clear();
+            active_lidar_points.clear();
 
             if (publish_odometry_without_downsample) {
               /******* Publish odometry *******/
@@ -878,11 +1193,6 @@ int main(int argc, char ** argv)
               }
             }
 
-            for (int j = 0; j < time_seq[k]; j++) {
-              PointType & point_body_j = feats_down_body->points[idx + j + 1];
-              PointType & point_world_j = feats_down_world->points[idx + j + 1];
-              pointBodyToWorld(&point_body_j, &point_world_j);
-            }
             solve_time += omp_get_wtime() - solve_start;
 
             update_time += omp_get_wtime() - t_update_start;
@@ -972,17 +1282,23 @@ int main(int argc, char ** argv)
         if (enable_prior_pcd) {
           sleep_time++;
           if (sleep_time > 200) {
-            MapIncremental();
+            queueMapIncremental(
+              lidar_end_time,
+              frame_diagnostics.effective_points >= static_cast<double>(map_min_effective_points));
           }
         } else {
-          MapIncremental();
+          queueMapIncremental(
+            lidar_end_time,
+            frame_diagnostics.effective_points >= static_cast<double>(map_min_effective_points));
         }
       }
+      processPendingMapUpdates(lidar_end_time);
       t5 = omp_get_wtime();
       /******* Publish points *******/
       if (path_en) publish_path(pub_path);
       if (scan_pub_en || pcd_save_en) publish_frame_world(pub_laser_cloud_full_res);
       if (scan_pub_en && scan_body_pub_en) publish_frame_body(pub_laser_cloud_full_res_body);
+      publish_diagnostics(pub_diagnostics, lidar_end_time, (t5 - t0) * 1000.0);
 
       /*** Debug variables Logging ***/
       if (runtime_pos_log) {
@@ -994,11 +1310,13 @@ int main(int argc, char ** argv)
         aver_time_match = aver_time_match * (frame_num - 1) / frame_num + (match_time) / frame_num;
         aver_time_solve = aver_time_solve * (frame_num - 1) / frame_num + solve_time / frame_num;
         aver_time_propag = aver_time_propag * (frame_num - 1) / frame_num + propag_time / frame_num;
-        T1[time_log_counter] = Measures.lidar_beg_time;
-        s_plot[time_log_counter] = t5 - t0;
-        s_plot2[time_log_counter] = feats_undistort->points.size();
-        s_plot3[time_log_counter] = aver_time_consu;
-        time_log_counter++;
+        if (time_log_counter < MAXN) {
+          T1[time_log_counter] = Measures.lidar_beg_time;
+          s_plot[time_log_counter] = t5 - t0;
+          s_plot2[time_log_counter] = feats_undistort->points.size();
+          s_plot3[time_log_counter] = aver_time_consu;
+          time_log_counter++;
+        }
         printf(
           "[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: "
           "%0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f propogate: %0.6f \n",

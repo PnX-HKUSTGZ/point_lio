@@ -10,6 +10,19 @@
 // #include <ikd-Tree/ikd_Tree.h>
 #include <pcl/io/pcd_io.h>
 #include <unordered_set>
+#include <cstdint>
+
+struct ActiveLidarPoint
+{
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  std::size_t source_index = 0;
+  V3D point_lidar = V3D::Zero();
+  V3D point_imu = V3D::Zero();
+  bool reanchored = false;
+};
+
+using ActiveLidarPointVector =
+  std::vector<ActiveLidarPoint, Eigen::aligned_allocator<ActiveLidarPoint>>;
 
 extern PointCloudXYZI::Ptr normvec; //(new PointCloudXYZI(100000, 1));
 extern std::vector<int> time_seq;
@@ -19,8 +32,10 @@ extern std::vector<V3D> pbody_list;
 extern std::vector<PointVector> Nearest_Points; 
 extern std::shared_ptr<IVoxType> ivox_;                    // localmap in ivox
 extern std::vector<float> pointSearchSqDis;
-extern bool point_selected_surf[100000]; // = {0};
+extern std::vector<std::uint8_t> point_selected_surf;
 extern std::vector<M3D> crossmat_list;
+extern ActiveLidarPointVector active_lidar_points;
+extern point_lio::FrameDiagnostics frame_diagnostics;
 extern int effct_feat_num;
 extern int k;
 extern int idx;

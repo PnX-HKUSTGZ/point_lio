@@ -41,6 +41,8 @@
 #include <Eigen/Geometry>
 #include <Eigen/Sparse>
 #include <boost/bind/bind.hpp>
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <vector>
 
@@ -190,6 +192,7 @@ public:
 
       F_x1 += f_x_final * dt;
       P_ = F_x1 * P_ * (F_x1).transpose() + Q * (dt * dt);
+      P_ = scalar_type(0.5) * (P_ + P_.transpose());
     }
   }
 
@@ -219,30 +222,44 @@ public:
       // dx_new = dx;
       // P_ = P_propagated;
 
+      if (!std::isfinite(m_noise) || m_noise <= scalar_type(0)) {
+        return false;
+      }
+
+      Matrix<scalar_type, Eigen::Dynamic, n> h_full =
+        Matrix<scalar_type, Eigen::Dynamic, n>::Zero(dof_Measurement, n);
+      h_full.template leftCols<12>() = h_x;
+      const cov P_prior = P_;
       Matrix<scalar_type, n, Eigen::Dynamic> PHT;
       Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> HPHT;
       Matrix<scalar_type, n, Eigen::Dynamic> K_;
       if (n > dof_Measurement) {
-        PHT = P_.template block<n, 12>(0, 0) * h_x.transpose();
+        PHT = P_prior * h_full.transpose();
         HPHT = h_x * PHT.topRows(12);
         for (int m = 0; m < dof_Measurement; m++) {
           HPHT(m, m) += m_noise;
         }
         K_ = PHT * HPHT.inverse();
       } else {
-        Matrix<scalar_type, 12, 12> HTH = m_noise * h_x.transpose() * h_x;
-        Matrix<scalar_type, n, n> P_inv = P_.inverse();
-        P_inv.template block<12, 12>(0, 0) += HTH;
-        P_inv = P_inv.inverse();
-        K_ = P_inv.template block<n, 12>(0, 0) * h_x.transpose() * m_noise;
+        const Matrix<scalar_type, 12, 12> HTH = h_x.transpose() * h_x / m_noise;
+        Matrix<scalar_type, n, n> information = P_prior.inverse();
+        information.template block<12, 12>(0, 0) += HTH;
+        const cov posterior = information.inverse();
+        K_ = posterior.template block<n, 12>(0, 0) * h_x.transpose() / m_noise;
       }
       Matrix<scalar_type, n, 1> dx_ =
         K_ * z;  // - h) + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new;
       // state x_before = x_;
 
       x_.boxplus(dx_);
-      {
-        P_ = P_ - K_ * h_x * P_.template block<12, n>(0, 0);
+      const cov identity_minus_kh = cov::Identity() - K_ * h_full;
+      P_ = identity_minus_kh * P_prior * identity_minus_kh.transpose() +
+           m_noise * K_ * K_.transpose();
+      P_ = scalar_type(0.5) * (P_ + P_.transpose());
+      if (!P_.allFinite()) {
+        P_ = P_prior;
+        x_ = x_propagated;
+        return false;
       }
     }
     return true;
@@ -280,6 +297,7 @@ public:
       Matrix<scalar_type, n, 1> dx_ = K * z;
 
       P_ -= K * HP;
+      P_ = scalar_type(0.5) * (P_ + P_.transpose());
       x_.boxplus(dx_);
     }
     return;
@@ -300,6 +318,8 @@ public:
   }
 
   void change_P(cov & input_cov) { P_ = input_cov; }
+
+  void set_maximum_iterations(int iterations) { maximum_iter = std::max(1, iterations); }
 
   const state & get_x() const { return x_; }
   const cov & get_P() const { return P_; }

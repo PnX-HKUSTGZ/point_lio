@@ -1,5 +1,8 @@
 #include "parameters.h"
 
+#include <algorithm>
+#include <cstdint>
+
 bool is_first_frame = true;
 double lidar_end_time = 0.0, first_lidar_time = 0.0, time_con = 0.0;
 double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0;
@@ -39,6 +42,13 @@ double time_diff_lidar_to_imu = 0.0;
 bool enable_prior_pcd;
 string prior_pcd_map_path;
 std::vector<double> init_pose;
+
+point_lio::SpatialAdaptiveConfig spatial_adaptive_config;
+point_lio::TemporalAdaptiveConfig temporal_adaptive_config;
+int min_scan_points = 100, max_lidar_queue_size = 5, max_imu_queue_size = 500;
+int ekf_max_iterations = 1, map_min_effective_points = 10;
+double max_scan_duration = 0.12, max_imu_time_gap = 0.03, max_neighbor_distance = 1.4;
+double map_insertion_delay = 0.30, map_impact_pause_duration = 0.50;
 
 double lidar_time_inte = 0.1, first_imu_time = 0.0;
 int cut_frame_num = 1, orig_odom_freq = 10;
@@ -228,6 +238,113 @@ void readParameters(std::shared_ptr<rclcpp::Node> & nh)
 
     nh->declare_parameter<int>("ivox_nearby_type", 18);
     nh->get_parameter("ivox_nearby_type", ivox_nearby_type);
+
+    nh->declare_parameter<int>("estimator.max_iterations", 1);
+    nh->get_parameter("estimator.max_iterations", ekf_max_iterations);
+    ekf_max_iterations = std::clamp(ekf_max_iterations, 1, 1);
+
+    nh->declare_parameter<int>("input_guard.min_scan_points", 100);
+    nh->get_parameter("input_guard.min_scan_points", min_scan_points);
+    nh->declare_parameter<double>("input_guard.max_scan_duration", 0.12);
+    nh->get_parameter("input_guard.max_scan_duration", max_scan_duration);
+    nh->declare_parameter<double>("input_guard.max_imu_time_gap", 0.03);
+    nh->get_parameter("input_guard.max_imu_time_gap", max_imu_time_gap);
+    nh->declare_parameter<int>("input_guard.max_lidar_queue", 5);
+    nh->get_parameter("input_guard.max_lidar_queue", max_lidar_queue_size);
+    nh->declare_parameter<int>("input_guard.max_imu_queue", 500);
+    nh->get_parameter("input_guard.max_imu_queue", max_imu_queue_size);
+
+    nh->declare_parameter<double>("mapping.max_neighbor_distance", 1.4);
+    nh->get_parameter("mapping.max_neighbor_distance", max_neighbor_distance);
+    int max_points_per_voxel = 64;
+    nh->declare_parameter<int>("mapping.max_points_per_voxel", max_points_per_voxel);
+    nh->get_parameter("mapping.max_points_per_voxel", max_points_per_voxel);
+    ivox_options_.max_points_per_voxel_ =
+      static_cast<std::size_t>(std::max(5, max_points_per_voxel));
+    nh->declare_parameter<double>("map_quality.insertion_delay", 0.30);
+    nh->get_parameter("map_quality.insertion_delay", map_insertion_delay);
+    nh->declare_parameter<double>("map_quality.impact_pause", 0.50);
+    nh->get_parameter("map_quality.impact_pause", map_impact_pause_duration);
+    nh->declare_parameter<int>("map_quality.min_effective_points", 10);
+    nh->get_parameter("map_quality.min_effective_points", map_min_effective_points);
+
+    nh->declare_parameter<bool>("adaptive.spatial.enabled", false);
+    nh->get_parameter("adaptive.spatial.enabled", spatial_adaptive_config.enabled);
+    std::vector<int64_t> spatial_neighbors{5, 10, 20};
+    nh->declare_parameter<std::vector<int64_t>>("adaptive.spatial.neighbors", spatial_neighbors);
+    nh->get_parameter("adaptive.spatial.neighbors", spatial_neighbors);
+    if (spatial_neighbors.size() == spatial_adaptive_config.neighbors.size()) {
+      for (std::size_t i = 0; i < spatial_neighbors.size(); ++i) {
+        spatial_adaptive_config.neighbors[i] = static_cast<int>(spatial_neighbors[i]);
+      }
+    }
+    std::vector<double> spatial_ranges{0.35, 0.70, 1.40};
+    nh->declare_parameter<std::vector<double>>("adaptive.spatial.max_query_ranges", spatial_ranges);
+    nh->get_parameter("adaptive.spatial.max_query_ranges", spatial_ranges);
+    if (spatial_ranges.size() == spatial_adaptive_config.max_query_ranges.size()) {
+      std::copy(spatial_ranges.begin(), spatial_ranges.end(), spatial_adaptive_config.max_query_ranges.begin());
+    }
+    nh->declare_parameter<double>("adaptive.spatial.max_curvature", 0.03);
+    nh->get_parameter("adaptive.spatial.max_curvature", spatial_adaptive_config.max_curvature);
+    nh->declare_parameter<double>("adaptive.spatial.max_plane_residual", 0.10);
+    nh->get_parameter(
+      "adaptive.spatial.max_plane_residual", spatial_adaptive_config.max_plane_residual);
+    nh->declare_parameter<double>("adaptive.spatial.normalized_residual_gate", 3.0);
+    nh->get_parameter(
+      "adaptive.spatial.normalized_residual_gate",
+      spatial_adaptive_config.normalized_residual_gate);
+    nh->declare_parameter<double>("adaptive.spatial.outlier_probability", 0.05);
+    nh->get_parameter(
+      "adaptive.spatial.outlier_probability", spatial_adaptive_config.outlier_probability);
+    nh->declare_parameter<double>("adaptive.spatial.student_t_dof", 5.0);
+    nh->get_parameter("adaptive.spatial.student_t_dof", spatial_adaptive_config.student_t_dof);
+    nh->declare_parameter<double>("adaptive.spatial.min_responsibility", 0.05);
+    nh->get_parameter(
+      "adaptive.spatial.min_responsibility", spatial_adaptive_config.min_responsibility);
+    nh->declare_parameter<double>("adaptive.spatial.degeneracy_eigen_ratio", 1.0e-4);
+    nh->get_parameter(
+      "adaptive.spatial.degeneracy_eigen_ratio",
+      spatial_adaptive_config.degeneracy_eigen_ratio);
+
+    nh->declare_parameter<bool>("adaptive.temporal.enabled", false);
+    nh->get_parameter("adaptive.temporal.enabled", temporal_adaptive_config.enabled);
+    nh->declare_parameter<int>("adaptive.temporal.min_points", 8);
+    nh->get_parameter("adaptive.temporal.min_points", temporal_adaptive_config.min_points);
+    nh->declare_parameter<int>("adaptive.temporal.initial_target_points", 32);
+    nh->get_parameter(
+      "adaptive.temporal.initial_target_points", temporal_adaptive_config.initial_target_points);
+    nh->declare_parameter<int>("adaptive.temporal.max_points", 128);
+    nh->get_parameter("adaptive.temporal.max_points", temporal_adaptive_config.max_points);
+    double min_duration_ms = 1.0;
+    nh->declare_parameter<double>("adaptive.temporal.min_duration_ms", min_duration_ms);
+    nh->get_parameter("adaptive.temporal.min_duration_ms", min_duration_ms);
+    temporal_adaptive_config.min_duration = min_duration_ms * 1.0e-3;
+    double max_duration_ms = 10.0;
+    nh->declare_parameter<double>("adaptive.temporal.max_duration_ms", max_duration_ms);
+    nh->get_parameter("adaptive.temporal.max_duration_ms", max_duration_ms);
+    temporal_adaptive_config.max_duration = max_duration_ms * 1.0e-3;
+    nh->declare_parameter<double>("adaptive.temporal.max_translation", 0.02);
+    nh->get_parameter(
+      "adaptive.temporal.max_translation", temporal_adaptive_config.max_translation);
+    double max_rotation_deg = 0.8;
+    nh->declare_parameter<double>("adaptive.temporal.max_rotation_deg", max_rotation_deg);
+    nh->get_parameter("adaptive.temporal.max_rotation_deg", max_rotation_deg);
+    temporal_adaptive_config.max_rotation = max_rotation_deg * M_PI / 180.0;
+    nh->declare_parameter<double>("adaptive.temporal.latency_penalty", 0.02);
+    nh->get_parameter(
+      "adaptive.temporal.latency_penalty",
+      temporal_adaptive_config.latency_penalty);
+    nh->declare_parameter<double>("adaptive.temporal.information_ema_alpha", 0.10);
+    nh->get_parameter(
+      "adaptive.temporal.information_ema_alpha",
+      temporal_adaptive_config.information_ema_alpha);
+    nh->declare_parameter<double>("adaptive.temporal.hysteresis_ratio", 0.15);
+    nh->get_parameter(
+      "adaptive.temporal.hysteresis_ratio", temporal_adaptive_config.hysteresis_ratio);
+    nh->declare_parameter<double>("adaptive.temporal.max_pose_covariance_trace", 1.0);
+    nh->get_parameter(
+      "adaptive.temporal.max_pose_covariance_trace",
+      temporal_adaptive_config.max_pose_covariance_trace);
   } catch (const rclcpp::ParameterTypeException & e) {
     RCLCPP_ERROR(nh->get_logger(), "Parameter type exception: %s", e.what());
   } catch (const std::exception & e) {
@@ -246,6 +363,23 @@ void readParameters(std::shared_ptr<rclcpp::Node> & nh)
     // LOG(WARNING) << "unknown ivox_nearby_type, use NEARBY18";
     ivox_options_.nearby_type_ = IVoxType::NearbyType::NEARBY18;
   }
+  cut_frame_init = cut_frame;
+  if (cut_frame_init && cut_frame_time_interval > 0.0) {
+    cut_frame_num = std::max(1, static_cast<int>(std::lround(lidar_time_inte / cut_frame_time_interval)));
+  }
+  con_frame_num = std::max(1, con_frame_num);
+  min_scan_points = std::max(1, min_scan_points);
+  max_lidar_queue_size = std::max(1, max_lidar_queue_size);
+  max_imu_queue_size = std::max(10, max_imu_queue_size);
+  max_neighbor_distance = std::max(0.1, max_neighbor_distance);
+  map_insertion_delay = std::max(0.0, map_insertion_delay);
+  map_impact_pause_duration = std::max(0.0, map_impact_pause_duration);
+  std::sort(spatial_adaptive_config.neighbors.begin(), spatial_adaptive_config.neighbors.end());
+  temporal_adaptive_config.min_points = std::max(1, temporal_adaptive_config.min_points);
+  temporal_adaptive_config.max_points =
+    std::max(temporal_adaptive_config.min_points, temporal_adaptive_config.max_points);
+  temporal_adaptive_config.latency_penalty =
+    std::max(1.0e-12, temporal_adaptive_config.latency_penalty);
   p_imu->gravity_ << VEC_FROM_ARRAY(gravity);
 }
 

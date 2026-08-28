@@ -115,6 +115,10 @@ T calc_dist(Eigen::Vector3d p1, PointType p2)
 template <typename T>
 std::vector<int> time_compressing(const PointCloudXYZI::Ptr & point_cloud)
 {
+  if (!point_cloud || point_cloud->empty()) {
+    return {};
+  }
+
   int points_size = point_cloud->points.size();
   int j = 0;
   std::vector<int> time_seq;

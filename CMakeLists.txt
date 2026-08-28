@@ -46,6 +46,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -90,6 +91,7 @@ ament_target_dependencies(pointlio_mapping
   nav_msgs
   sensor_msgs
   visualization_msgs
+  diagnostic_msgs
   pcl_ros
   pcl_conversions
   tf2_ros
@@ -98,6 +100,14 @@ ament_target_dependencies(pointlio_mapping
 
 target_link_libraries(pointlio_mapping ${PCL_LIBRARIES} ${PYTHON_LIBRARIES})
 target_include_directories(pointlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_adaptive_lio test/test_adaptive_lio.cpp)
+  target_include_directories(test_adaptive_lio PRIVATE include ${EIGEN3_INCLUDE_DIR} ${PCL_INCLUDE_DIRS})
+  ament_target_dependencies(test_adaptive_lio rclcpp nav_msgs sensor_msgs tf2_ros)
+  target_link_libraries(test_adaptive_lio ${PCL_LIBRARIES})
+endif()
 
 # Install the executable
 install(TARGETS
@@ -117,6 +127,7 @@ ament_export_dependencies(
   geometry_msgs
   nav_msgs
   sensor_msgs
+  diagnostic_msgs
   pcl_ros
   pcl_conversions
   tf2_ros

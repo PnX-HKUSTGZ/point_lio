@@ -58,6 +58,8 @@ public:
 
   void InsertPoint(const PointT & pt);
 
+  void SetMaxPoints(std::size_t max_points) { max_points_ = std::max<std::size_t>(1, max_points); }
+
   inline bool Empty() const;
 
   inline std::size_t Size() const;
@@ -70,6 +72,8 @@ public:
 
 private:
   std::vector<PointT> points_;
+  std::size_t max_points_ = 64;
+  std::size_t replacement_index_ = 0;
 };
 
 template <typename PointT, int dim = 3>
@@ -85,6 +89,8 @@ public:
   IVoxNodePhc(const PointT & center, const float & side_length, const int & phc_order = 6);
 
   void InsertPoint(const PointT & pt);
+
+  void SetMaxPoints(std::size_t max_points) { (void)max_points; }
 
   void ErasePoint(const PointT & pt, const double erase_distance_th_);
 
@@ -134,7 +140,12 @@ struct IVoxNode<PointT, dim>::DistPoint
 template <typename PointT, int dim>
 void IVoxNode<PointT, dim>::InsertPoint(const PointT & pt)
 {
-  points_.template emplace_back(pt);
+  if (points_.size() < max_points_) {
+    points_.template emplace_back(pt);
+    return;
+  }
+  points_[replacement_index_ % max_points_] = pt;
+  ++replacement_index_;
 }
 
 template <typename PointT, int dim>
