@@ -64,6 +64,7 @@ public:
     float inv_resolution_ = 10.0;                   // inverse resolution
     NearbyType nearby_type_ = NearbyType::NEARBY6;  // nearby range
     std::size_t capacity_ = 1000000;                // capacity
+    float point_resolution_ = 0.0f;                // 0 preserves legacy insertion
   };
 
   /**
@@ -153,6 +154,7 @@ template <int dim, IVoxNodeType node_type, typename PointType>
 bool IVox<dim, node_type, PointType>::GetClosestPoint(
   const PointType & pt, PointVector & closest_pt, int max_num, double max_range)
 {
+  closest_pt.clear();  // No candidate must not leave a previous scan's neighbors.
   std::vector<DistPoint> candidates;
   candidates.reserve(max_num * nearby_grids_.size());
 
@@ -280,6 +282,7 @@ template <int dim, IVoxNodeType node_type, typename PointType>
 void IVox<dim, node_type, PointType>::AddPoints(const PointVector & points_to_add)
 {
   for (size_t i = 0; i < points_to_add.size(); i++) {
+    if (!points_to_add[i].getVector3fMap().allFinite()) continue;
     auto key = Pos2Grid(
       Eigen::Matrix<float, dim, 1>(points_to_add[i].x, points_to_add[i].y, points_to_add[i].z));
     auto iter = grids_map_.find(key);
@@ -287,7 +290,12 @@ void IVox<dim, node_type, PointType>::AddPoints(const PointVector & points_to_ad
       PointType center;
       center.getVector3fMap() = key.template cast<float>() * options_.resolution_;
 
-      grids_cache_.push_front({key, NodeType(center, options_.resolution_)});
+      if constexpr (node_type == IVoxNodeType::DEFAULT) {
+        grids_cache_.push_front(
+          {key, NodeType(center, options_.resolution_, options_.point_resolution_)});
+      } else {
+        grids_cache_.push_front({key, NodeType(center, options_.resolution_)});
+      }
       grids_map_.insert({key, grids_cache_.begin()});
 
       grids_cache_.front().second.InsertPoint(points_to_add[i]);
@@ -320,18 +328,19 @@ Eigen::Matrix<int, dim, 1> IVox<dim, node_type, PointType>::Pos2Grid_(
 template <int dim, IVoxNodeType node_type, typename PointType>
 std::vector<float> IVox<dim, node_type, PointType>::StatGridPoints() const
 {
+  if (grids_cache_.empty()) return std::vector<float>(5, 0.0f);
   int num = grids_cache_.size(), valid_num = 0, max = 0, min = 100000000;
-  int sum = 0, sum_square = 0;
+  double sum = 0, sum_square = 0;
   for (auto & it : grids_cache_) {
     int s = it.second.Size();
     valid_num += s > 0;
     max = s > max ? s : max;
     min = s < min ? s : min;
     sum += s;
-    sum_square += s * s;
+    sum_square += static_cast<double>(s) * s;
   }
   float ave = float(sum) / num;
-  float stddev = num > 1 ? sqrt((float(sum_square) - num * ave * ave) / (num - 1)) : 0;
+  float stddev = num > 1 ? sqrt(std::max(0.0, (sum_square - sum * sum / num) / (num - 1))) : 0;
   return std::vector<float>{
     static_cast<float>(valid_num), ave, static_cast<float>(max), static_cast<float>(min), stddev};
 }

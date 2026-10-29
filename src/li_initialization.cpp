@@ -173,6 +173,11 @@ void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr & msg_in)
     // sig_buffer.notify_all();
     return;
   }
+  if (last_timestamp_imu > 0.0 && timestamp - last_timestamp_imu > 2.5 * imu_time_inte) {
+    RCLCPP_WARN(rclcpp::get_logger("li_initialization"),
+      "IMU timestamp gap: %.4f s (expected %.4f s)",
+      timestamp - last_timestamp_imu, imu_time_inte);
+  }
   imu_deque.emplace_back(msg);
   last_timestamp_imu = timestamp;
   // mtx_buffer.unlock();

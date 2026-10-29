@@ -121,6 +121,8 @@ class Preprocess
   int lidar_type, point_filter_num, N_SCANS, SCAN_RATE, time_unit;
   double blind, det_range;
   bool given_offset_time;
+  // Velodyne points were acquired simultaneously at the message stamp.
+  bool instantaneous_scan = false;
 
   private:
   void avia_handler(const livox_ros_driver2::msg::CustomMsg::SharedPtr &msg);

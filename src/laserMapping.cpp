@@ -378,7 +378,11 @@ int main(int argc, char ** argv)
       [](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { standard_pcl_cbk(msg); });
   }
   auto sub_imu =
-    nh->create_subscription<sensor_msgs::msg::Imu>(imu_topic, rclcpp::SensorDataQoS(), imu_cbk);
+    nh->create_subscription<sensor_msgs::msg::Imu>(
+      imu_topic, rclcpp::SensorDataQoS().keep_last(2000), imu_cbk);
+  // Matching runs on this executor thread. The default five IMU samples
+  // cover only 50 ms at 100 Hz (5 ms at 1 kHz), shorter than a dense scan.
+  // Retain timestamped IMU history across computation; never re-stamp it.
   auto pub_laser_cloud_full_res =
     nh->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered", 20);
   auto pub_laser_cloud_full_res_body =
@@ -543,8 +547,8 @@ int main(int argc, char ** argv)
       t2 = omp_get_wtime();
 
       /*** iterated state estimation ***/
-      crossmat_list.reserve(feats_down_size);
-      pbody_list.reserve(feats_down_size);
+      crossmat_list.resize(feats_down_size);
+      pbody_list.resize(feats_down_size);
       // pbody_ext_list.reserve(feats_down_size);
 
       for (size_t i = 0; i < feats_down_body->size(); i++) {
@@ -983,6 +987,20 @@ int main(int argc, char ** argv)
       if (path_en) publish_path(pub_path);
       if (scan_pub_en || pcd_save_en) publish_frame_world(pub_laser_cloud_full_res);
       if (scan_pub_en && scan_body_pub_en) publish_frame_body(pub_laser_cloud_full_res_body);
+
+      // Low-rate diagnostics separate frontend computation/backlog from
+      // downstream map/controller delays without enabling per-frame files.
+      static double last_health_stamp = -1.0;
+      if (lidar_end_time - last_health_stamp >= 5.0 || lidar_end_time < last_health_stamp) {
+        const auto stats = ivox_->StatGridPoints();
+        RCLCPP_INFO(LOGGER,
+          "Frontend health: stamp=%.3f age=%.3f compute_ms=%.1f features=%d "
+          "cells=%.0f mean_points=%.1f max_points=%.0f lidar_queue=%zu imu_queue=%zu",
+          lidar_end_time, nh->now().seconds() - lidar_end_time,
+          (omp_get_wtime() - t0) * 1000.0, feats_down_size,
+          stats[0], stats[1], stats[2], lidar_buffer.size(), imu_deque.size());
+        last_health_stamp = lidar_end_time;
+      }
 
       /*** Debug variables Logging ***/
       if (runtime_pos_log) {

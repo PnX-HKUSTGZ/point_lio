@@ -119,6 +119,13 @@ void readParameters(std::shared_ptr<rclcpp::Node> & nh)
 
     nh->declare_parameter<double>("filter_size_map", 0.5);
     nh->get_parameter("filter_size_map", filter_size_map_min);
+    const bool deduplicate_map = nh->declare_parameter<bool>("mapping.deduplicate_map", false);
+    if (deduplicate_map) {
+      if (!std::isfinite(filter_size_map_min) || filter_size_map_min <= 0.0) {
+        throw std::invalid_argument("filter_size_map must be finite and positive");
+      }
+      ivox_options_.point_resolution_ = static_cast<float>(filter_size_map_min);
+    }
 
     nh->declare_parameter<float>("mapping.det_range", 300.f);
     nh->get_parameter("mapping.det_range", DET_RANGE);
@@ -176,6 +183,9 @@ void readParameters(std::shared_ptr<rclcpp::Node> & nh)
 
     nh->declare_parameter<int>("preprocess.scan_rate", 10);
     nh->get_parameter("preprocess.scan_rate", p_pre->SCAN_RATE);
+
+    nh->declare_parameter<bool>("preprocess.instantaneous_scan", false);
+    nh->get_parameter("preprocess.instantaneous_scan", p_pre->instantaneous_scan);
 
     nh->declare_parameter<int>("preprocess.timestamp_unit", 1);
     nh->get_parameter("preprocess.timestamp_unit", p_pre->time_unit);

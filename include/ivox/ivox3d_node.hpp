@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <unordered_map>
 
+#include "eigen_types.h"
 #include "hilbert.hpp"
 
 namespace faster_lio
@@ -54,7 +56,8 @@ public:
   struct DistPoint;
 
   IVoxNode() = default;
-  IVoxNode(const PointT & center, const float & side_length) {}  /// same with phc
+  IVoxNode(const PointT &, const float &, float point_resolution = 0.0f)
+  : point_resolution_(point_resolution) {}
 
   void InsertPoint(const PointT & pt);
 
@@ -70,6 +73,10 @@ public:
 
 private:
   std::vector<PointT> points_;
+  // One representative per map voxel, including points inserted together
+  // during map initialization. KNN-based filtering cannot enforce this.
+  float point_resolution_ = 0.0f;
+  std::unordered_map<Eigen::Vector3i, std::size_t, hash_vec<3>> point_voxels_;
 };
 
 template <typename PointT, int dim = 3>
@@ -134,6 +141,22 @@ struct IVoxNode<PointT, dim>::DistPoint
 template <typename PointT, int dim>
 void IVoxNode<PointT, dim>::InsertPoint(const PointT & pt)
 {
+  if (point_resolution_ > 0.0f) {
+    const Eigen::Vector3f xyz = pt.getVector3fMap();
+    if (!xyz.allFinite()) return;
+    const Eigen::Vector3i key = (xyz / point_resolution_).array().floor().template cast<int>();
+    auto [it, inserted] = point_voxels_.emplace(key, points_.size());
+    if (!inserted) {
+      const Eigen::Vector3f center =
+        (key.template cast<float>().array() + 0.5f) * point_resolution_;
+      auto & previous = points_[it->second];
+      if ((xyz - center).squaredNorm() <
+          (previous.getVector3fMap() - center).squaredNorm()) {
+        previous = pt;
+      }
+      return;
+    }
+  }
   points_.template emplace_back(pt);
 }
 

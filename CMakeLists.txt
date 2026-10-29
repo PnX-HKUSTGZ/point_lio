@@ -99,6 +99,20 @@ ament_target_dependencies(pointlio_mapping
 target_link_libraries(pointlio_mapping ${PCL_LIBRARIES} ${PYTHON_LIBRARIES})
 target_include_directories(pointlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
 
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(test_instantaneous_scan test/test_instantaneous_scan.cpp src/preprocess.cpp)
+  target_include_directories(test_instantaneous_scan PRIVATE src)
+  ament_target_dependencies(test_instantaneous_scan rclcpp sensor_msgs pcl_ros pcl_conversions livox_ros_driver2)
+  target_link_libraries(test_instantaneous_scan ${PCL_LIBRARIES})
+  add_test(NAME instantaneous_scan COMMAND test_instantaneous_scan)
+  add_executable(test_ekf_measurement_noise test/test_ekf_measurement_noise.cpp)
+  add_test(NAME ekf_measurement_noise COMMAND test_ekf_measurement_noise)
+  add_executable(test_ivox_map_density test/test_ivox_map_density.cpp)
+  target_link_libraries(test_ivox_map_density ${PCL_LIBRARIES})
+  add_test(NAME ivox_map_density COMMAND test_ivox_map_density)
+endif()
+
 # Install the executable
 install(TARGETS
   pointlio_mapping

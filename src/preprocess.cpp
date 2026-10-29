@@ -167,6 +167,7 @@ void Preprocess::process_cut_frame_pcl2(
     pcl::PointCloud<velodyne_ros::Point> pl_orig;
     pcl::fromROSMsg(*msg, pl_orig);
     int plsize = pl_orig.points.size();
+    if (plsize == 0) return;
     pl_surf.reserve(plsize);
 
     bool is_first[MAX_LINE_NUM];
@@ -175,7 +176,7 @@ void Preprocess::process_cut_frame_pcl2(
     float yaw_last[MAX_LINE_NUM] = {0.0};   // yaw of last scan point
     float time_last[MAX_LINE_NUM] = {0.0};  // last offset time
 
-    if (pl_orig.points[plsize - 1].time > 0) {
+    if (instantaneous_scan || pl_orig.points[plsize - 1].time > 0) {
       given_offset_time = true;
     } else {
       std::cout << "Compute offset time using constant rotation model." << '\n';
@@ -192,7 +193,7 @@ void Preprocess::process_cut_frame_pcl2(
       added_pt.y = pl_orig.points[i].y;
       added_pt.z = pl_orig.points[i].z;
       added_pt.intensity = pl_orig.points[i].intensity;
-      added_pt.curvature = pl_orig.points[i].time * 1000.0;  //ms
+      added_pt.curvature = instantaneous_scan ? 0.0f : pl_orig.points[i].time * 1000.0f;  //ms
 
       double dist = added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z;
       if (
@@ -202,6 +203,7 @@ void Preprocess::process_cut_frame_pcl2(
 
       if (!given_offset_time) {
         int layer = pl_orig.points[i].ring;
+        if (layer >= MAX_LINE_NUM) continue;
         double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
         if (is_first[layer]) {
@@ -283,6 +285,16 @@ void Preprocess::process_cut_frame_pcl2(
     }
   } else {
     std::cout << "Wrong LiDAR Type!!!" << '\n';
+    return;
+  }
+
+  // Simultaneous points cannot be split into time-ordered subframes.
+  // Preserve the whole filtered frame, including its first point.
+  if (lidar_type == VELO16 && instantaneous_scan) {
+    if (!pl_surf.empty()) {
+      pcl_out.push_back(PointCloudXYZI::Ptr(new PointCloudXYZI(pl_surf)));
+      time_lidar.push_back(rclcpp::Time(msg->header.stamp).seconds() * 1000);
+    }
     return;
   }
 
@@ -422,7 +434,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::SharedPtr
   std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
   /*****************************************************************/
 
-  if (pl_orig.points[plsize - 1].time > 0) {
+  if (instantaneous_scan || pl_orig.points[plsize - 1].time > 0) {
     given_offset_time = true;
   } else {
     given_offset_time = false;
@@ -451,8 +463,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::SharedPtr
     added_pt.z = pl_orig.points[i].z;
     added_pt.intensity = pl_orig.points[i].intensity;
     added_pt.curvature =
-      pl_orig.points[i].time *
-      time_unit_scale;  // curvature unit: ms // std::cout<<added_pt.curvature<<'\n';
+      (instantaneous_scan ? 0.0f : pl_orig.points[i].time * time_unit_scale);  // curvature unit: ms // std::cout<<added_pt.curvature<<'\n';
     if (
       i % point_filter_num != 0 || std::isnan(added_pt.x) || std::isnan(added_pt.y) ||
       std::isnan(added_pt.z))
